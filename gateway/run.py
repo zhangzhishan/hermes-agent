@@ -1713,6 +1713,7 @@ from gateway.session import (
     is_shared_multi_user_session,
 )
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
+from gateway.topic_context import load_topic_context_block
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -10602,6 +10603,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        topic_context = load_topic_context_block(
+            platform=context.source.platform,
+            chat_id=context.source.chat_id,
+            thread_id=context.source.thread_id,
+            chat_name=context.source.chat_name,
+            hermes_home=_hermes_home,
+        )
+        if topic_context:
+            context_prompt = (context_prompt + "\n\n" + topic_context).strip()
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
