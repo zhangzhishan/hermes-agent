@@ -2432,6 +2432,7 @@ from gateway.session_state import (
     legacy_dict_property,
     legacy_lease_token_property,
 )
+from gateway.topic_context import load_topic_context_block
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -23870,7 +23871,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         re-render ``build_session_context_prompt`` and re-pin (a legitimate
         cache bust: rename, topic edit, /sethome, redact_pii flip, ...).
         """
-        _eph_key = self._ephemeral_change_key(context, redact_pii)
+        src = context.source
+        topic_context = load_topic_context_block(
+            platform=src.platform,
+            chat_id=src.chat_id,
+            thread_id=src.thread_id,
+            chat_name=src.chat_name,
+            hermes_home=_hermes_home,
+        )
+        _eph_key = self._ephemeral_change_key(
+            context, redact_pii, topic_context=topic_context
+        )
         _eph_pin = None
         if session_key:
             _pin_state = self._peek_session_state(session_key)
@@ -23878,6 +23889,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _eph_pin is not None and _eph_pin[0] == _eph_key:
             return _eph_pin[1]
         text = build_session_context_prompt(context, redact_pii=redact_pii)
+        if topic_context:
+            text = (text + "\n\n" + topic_context).strip()
         if session_key:
             self._session_state(session_key).conversation.ephemeral_pin = (
                 _eph_key,
@@ -23886,7 +23899,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return text
 
     @staticmethod
-    def _ephemeral_change_key(context, redact_pii: bool) -> str:
+    def _ephemeral_change_key(
+        context, redact_pii: bool, *, topic_context: Optional[str] = None
+    ) -> str:
         """Hash the exact inputs ``build_session_context_prompt`` renders.
 
         This key decides when the pinned per-session context-prompt bytes are
@@ -23961,6 +23976,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
             bool(redact_pii),
             home_display,
+            str(topic_context or ""),
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 
