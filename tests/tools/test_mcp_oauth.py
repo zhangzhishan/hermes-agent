@@ -824,6 +824,28 @@ def test_figma_provider_defaults_set_allowlisted_client_name():
     assert cfg["scope"] == _FIGMA_DEFAULT_SCOPE
 
 
+def test_ibkr_provider_defaults_set_allowlisted_client_and_endpoints():
+    from tools.mcp_oauth import (
+        apply_oauth_provider_defaults,
+        _IBKR_DCR_CLIENT_NAME,
+        _IBKR_DEFAULT_SCOPE,
+    )
+
+    cfg = apply_oauth_provider_defaults(
+        {},
+        server_name="ibkr",
+        server_url="https://api.ibkr.com/v1/api/mcp-public",
+    )
+    assert cfg["client_name"] == _IBKR_DCR_CLIENT_NAME
+    assert cfg["scope"] == _IBKR_DEFAULT_SCOPE
+    assert cfg["authorization_endpoint"] == (
+        "https://api.ibkr.com/oauth2/authorize"
+    )
+    assert cfg["token_endpoint"] == (
+        "https://api.ibkr.com/oauth2/api/v1/token"
+    )
+
+
 def test_humanize_non_registration_403_passthrough():
     from tools.mcp_oauth import humanize_oauth_registration_error
 

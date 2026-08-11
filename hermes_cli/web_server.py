@@ -12365,10 +12365,21 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
                         flow.server_name,
                         hermes_home=flow.hermes_home,
                     )
+                    oauth_cfg = cfg.get("oauth") or {}
+                    try:
+                        oauth_callback_timeout = float(
+                            oauth_cfg.get("timeout", 300) or 300
+                        )
+                    except (TypeError, ValueError):
+                        oauth_callback_timeout = 300.0
                     tools = _probe_single_server(
                         flow.server_name,
                         cfg,
-                        connect_timeout=max(float(cfg.get("connect_timeout", 0) or 0), 315),
+                        connect_timeout=max(
+                            float(cfg.get("connect_timeout", 0) or 0),
+                            oauth_callback_timeout + 15.0,
+                            315.0,
+                        ),
                     )
                     if not _oauth_tokens_present(flow.server_name):
                         raise RuntimeError(

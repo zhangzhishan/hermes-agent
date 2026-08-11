@@ -754,7 +754,11 @@ class TestMcpLogin:
     def test_login_genuine_success_with_token(self, tmp_path, capsys, monkeypatch):
         """Probe lists tools AND a token exists → report real success."""
         _seed_config(tmp_path, {
-            "realserver": {"url": "https://mcp.example.com/mcp", "auth": "oauth"},
+            "realserver": {
+                "url": "https://mcp.example.com/mcp",
+                "auth": "oauth",
+                "oauth": {"timeout": 900},
+            },
         })
         token_dir = tmp_path / "mcp-tokens"
 
@@ -780,9 +784,9 @@ class TestMcpLogin:
 
         assert "Authenticated — 3 tool(s) available" in out
         assert "no OAuth token" not in out
-        # The login path must grant a human enough time to finish the browser
-        # OAuth round-trip — far longer than the 30s probe default.
-        assert seen["connect_timeout"] >= 180
+        # oauth.timeout=900 keeps both the callback waiter and outer probe alive;
+        # the probe gets 15 seconds of shutdown/headroom.
+        assert seen["connect_timeout"] == 915.0
 
 
 # ---------------------------------------------------------------------------

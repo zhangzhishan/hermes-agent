@@ -831,7 +831,19 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             _login_connect_timeout = float(_login_connect_timeout)
         except (TypeError, ValueError):
             _login_connect_timeout = 0.0
-        _login_connect_timeout = max(_login_connect_timeout, 315.0)
+        oauth_config = server_config.get("oauth") or {}
+        try:
+            oauth_callback_timeout = float(oauth_config.get("timeout", 300) or 300)
+        except (TypeError, ValueError):
+            oauth_callback_timeout = 300.0
+        # Keep the outer connection probe alive for the full interactive OAuth
+        # callback window. Providers with slow multi-factor flows can raise
+        # oauth.timeout above the 300-second default.
+        _login_connect_timeout = max(
+            _login_connect_timeout,
+            oauth_callback_timeout + 15.0,
+            315.0,
+        )
         with force_interactive_oauth():
             tools = _probe_single_server(
                 name, server_config, connect_timeout=_login_connect_timeout

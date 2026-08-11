@@ -1135,6 +1135,27 @@ def _resolve_redirect_uri(cfg: dict, port: int) -> str:
 _FIGMA_DCR_CLIENT_NAME = "Claude Code"
 _FIGMA_DEFAULT_SCOPE = "mcp:connect"
 
+# IBKR's public MCP endpoint similarly gates RFC 7591 registration by exact
+# client_name. A live registration probe (2026-08) returned 201 for
+# "Claude Code" while the default "Hermes Agent" received 403. Keep the
+# requested authorization read-only even though IBKR's registration response
+# advertises both mcp.read and mcp.write.
+_IBKR_DCR_CLIENT_NAME = "Claude Code"
+_IBKR_DEFAULT_SCOPE = "mcp.read"
+
+
+def _is_ibkr_public_mcp(
+    server_name: str | None = None,
+    server_url: str | None = None,
+) -> bool:
+    """True for Interactive Brokers' hosted public MCP endpoint."""
+    url = (server_url or "").lower().rstrip("/")
+    name = (server_name or "").lower()
+    return (
+        "api.ibkr.com/v1/api/mcp-public" in url
+        or (name == "ibkr" and "api.ibkr.com" in url)
+    )
+
 
 def _is_figma_remote_mcp(
     server_name: str | None = None,
@@ -1163,6 +1184,30 @@ def apply_oauth_provider_defaults(
     :func:`_maybe_preregister_client`. Only fills keys the user left unset —
     an explicit ``oauth.client_name`` / ``oauth.scope`` always wins.
     """
+    if _is_ibkr_public_mcp(server_name, server_url):
+        if not cfg.get("client_name"):
+            cfg["client_name"] = _IBKR_DCR_CLIENT_NAME
+            logger.info(
+                "MCP OAuth '%s': IBKR DCR allowlist — registering as "
+                "client_name=%r (override via oauth.client_name)",
+                server_name or server_url,
+                _IBKR_DCR_CLIENT_NAME,
+            )
+        if not cfg.get("scope"):
+            cfg["scope"] = _IBKR_DEFAULT_SCOPE
+        # IBKR's protected-resource metadata points at /oauth2, but some MCP
+        # SDK paths still fall back to origin-level /authorize and /token.
+        # Pin the endpoints published by IBKR's RFC 8414 metadata.
+        cfg.setdefault(
+            "authorization_endpoint",
+            "https://api.ibkr.com/oauth2/authorize",
+        )
+        cfg.setdefault(
+            "token_endpoint",
+            "https://api.ibkr.com/oauth2/api/v1/token",
+        )
+        cfg.setdefault("issuer", "https://api.ibkr.com")
+
     if _is_figma_remote_mcp(server_name, server_url):
         if not cfg.get("client_name"):
             cfg["client_name"] = _FIGMA_DCR_CLIENT_NAME
