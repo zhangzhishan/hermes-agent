@@ -134,11 +134,15 @@ def _make_hermes_provider_class() -> Optional[type]:
             *args: Any,
             server_name: str = "",
             preregistered: bool = False,
+            oauth_metadata_override: Any = None,
+            configured_scope: str | None = None,
             **kwargs: Any,
         ):
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
             self._hermes_home = ""
+            self._hermes_oauth_metadata_override = oauth_metadata_override
+            self._hermes_configured_scope = configured_scope
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
@@ -179,6 +183,16 @@ def _make_hermes_provider_class() -> Optional[type]:
             remaining TTL we compute here reflects real wall-clock age.
             """
             await super()._initialize()
+            # Some providers publish incomplete/inconsistent discovery metadata
+            # (IBKR currently advertises an auth-server path but Hermes' MCP SDK
+            # can still fall back to the origin-level /authorize endpoint). Let
+            # config.yaml pin verified OAuth endpoints. This takes precedence
+            # over stale metadata persisted by an earlier failed login.
+            metadata_override = getattr(
+                self, "_hermes_oauth_metadata_override", None
+            )
+            if metadata_override is not None:
+                self.context.oauth_metadata = metadata_override
             tokens = self.context.current_tokens
             if tokens is not None and tokens.expires_in is not None:
                 self.context.update_token_expiry(tokens)
@@ -223,6 +237,19 @@ def _make_hermes_provider_class() -> Optional[type]:
                         "failed (non-fatal): %s",
                         self._hermes_server_name, exc,
                     )
+
+        async def _perform_authorization(self) -> Any:
+            """Honor an explicitly configured scope at the redirect boundary.
+
+            The MCP SDK normally replaces the client-configured scope with every
+            scope advertised by protected-resource metadata. For providers that
+            expose both read and write scopes, this can silently widen a read-only
+            request. Re-apply the explicit scope just before building the URL.
+            """
+            configured_scope = getattr(self, "_hermes_configured_scope", None)
+            if configured_scope:
+                self.context.client_metadata.scope = configured_scope
+            return await super()._perform_authorization()
 
         async def _prefetch_oauth_metadata(self) -> None:
             """Fetch PRM + ASM from the well-known endpoints, cache on context.
@@ -572,6 +599,38 @@ class MCPOAuthManager:
         client_metadata = _build_client_metadata(cfg)
         _maybe_preregister_client(storage, cfg, client_metadata)
 
+        oauth_metadata_override = None
+        authorization_endpoint = cfg.get("authorization_endpoint")
+        token_endpoint = cfg.get("token_endpoint")
+        if authorization_endpoint or token_endpoint:
+            if not authorization_endpoint or not token_endpoint:
+                raise ValueError(
+                    "MCP OAuth endpoint override requires both "
+                    "oauth.authorization_endpoint and oauth.token_endpoint"
+                )
+            from urllib.parse import urlsplit
+            from mcp.shared.auth import OAuthMetadata
+
+            parsed = urlsplit(str(authorization_endpoint))
+            issuer = cfg.get("issuer") or f"{parsed.scheme}://{parsed.netloc}"
+            metadata_dict: dict[str, Any] = {
+                "issuer": issuer,
+                "authorization_endpoint": authorization_endpoint,
+                "token_endpoint": token_endpoint,
+            }
+            for field_name in (
+                "registration_endpoint",
+                "revocation_endpoint",
+                "scopes_supported",
+                "response_types_supported",
+                "grant_types_supported",
+                "token_endpoint_auth_methods_supported",
+                "code_challenge_methods_supported",
+            ):
+                if cfg.get(field_name) is not None:
+                    metadata_dict[field_name] = cfg[field_name]
+            oauth_metadata_override = OAuthMetadata.model_validate(metadata_dict)
+
         resolved_port = cfg.get("_resolved_port", 0)
         redirect_handler = _make_redirect_handler(resolved_port)
         callback_handler = _make_callback_waiter(resolved_port)
@@ -579,6 +638,8 @@ class MCPOAuthManager:
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
             preregistered=bool(cfg.get("client_id")),
+            oauth_metadata_override=oauth_metadata_override,
+            configured_scope=cfg.get("scope"),
             server_url=entry.server_url,
             client_metadata=client_metadata,
             storage=storage,

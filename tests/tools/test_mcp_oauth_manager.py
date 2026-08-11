@@ -84,6 +84,64 @@ def test_hermes_provider_subclass_exists():
 
 
 @pytest.mark.asyncio
+async def test_explicit_oauth_endpoints_override_discovery_fallback(tmp_path, monkeypatch):
+    """Configured endpoints prevent a provider from falling back to /authorize."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    provider = MCPOAuthManager().get_or_build_provider(
+        "ibkr-like",
+        "https://api.example.com/v1/api/mcp-public",
+        {
+            "client_id": "pre-registered-client",
+            "authorization_endpoint": "https://api.example.com/oauth2/authorize",
+            "token_endpoint": "https://api.example.com/oauth2/token",
+            "scope": "mcp.read",
+        },
+    )
+    await provider._initialize()
+
+    assert str(provider.context.oauth_metadata.authorization_endpoint) == (
+        "https://api.example.com/oauth2/authorize"
+    )
+    assert str(provider.context.oauth_metadata.token_endpoint) == (
+        "https://api.example.com/oauth2/token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_scope_is_reapplied_before_authorization(tmp_path, monkeypatch):
+    """A configured read-only scope must not widen to all PRM scopes."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    provider = MCPOAuthManager().get_or_build_provider(
+        "scope-pin",
+        "https://api.example.com/mcp",
+        {"client_id": "client", "scope": "mcp.read"},
+    )
+    provider.context.client_metadata.scope = "mcp.read mcp.write"
+    captured = {}
+
+    async def _fake_perform_authorization(self):
+        captured["scope"] = self.context.client_metadata.scope
+        return "sentinel"
+
+    monkeypatch.setattr(
+        OAuthClientProvider,
+        "_perform_authorization",
+        _fake_perform_authorization,
+    )
+    assert await provider._perform_authorization() == "sentinel"
+    assert captured["scope"] == "mcp.read"
+
+
+@pytest.mark.asyncio
 async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     """When the tokens file mtime changes, provider._initialized flips False.
 
