@@ -52,7 +52,10 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
 
     _hermes_logger = logger
 
-    def __init__(self, *args: Any, server_name: str = "", preregistered: bool = False, **kwargs: Any):
+    def __init__(self, *args: Any, server_name: str = "", preregistered: bool = False,
+                 oauth_metadata_override: Any = None, configured_scope: str | None = None,
+                 pkce_verifier_bytes: int | None = None, include_scope_in_token_request: bool = False,
+                 **kwargs: Any):
         super().__init__(*args, **kwargs)
         # mcp 2.0 uses a task-owned anyio.Lock held across the yielded resource request (a session-long GET blocks
         # every POST; HTTPX may close the generator from another task). A binary semaphore drops task ownership.
@@ -60,6 +63,10 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
         self.context.lock = anyio.Semaphore(1, max_value=1)
         self._hermes_server_name = server_name
         self._hermes_home = ""
+        self._hermes_oauth_metadata_override = oauth_metadata_override
+        self._hermes_configured_scope = configured_scope
+        self._hermes_pkce_verifier_bytes = pkce_verifier_bytes
+        self._hermes_include_scope_in_token_request = include_scope_in_token_request
         # A config-supplied client_id rejected as invalid_client means the *config* is wrong — only DCR clients auto-heal.
         self._hermes_preregistered = preregistered
 
@@ -79,6 +86,8 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
         pre-flight when we hold tokens but no metadata: otherwise ``_refresh_token`` guesses
         ``{server_url}/token`` (wrong for split-origin providers), 404s, and we fall to browser reauth."""
         await super()._initialize()
+        if self._hermes_oauth_metadata_override is not None:
+            self.context.oauth_metadata = self._hermes_oauth_metadata_override
         tokens = self.context.current_tokens
         if tokens is not None and tokens.expires_in is not None:
             self.context.update_token_expiry(tokens)
@@ -94,6 +103,177 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                 await self._prefetch_oauth_metadata()
             except Exception as exc:  # pragma: no cover — the SDK's 401-branch discovery runs next request
                 self._log_nonfatal("pre-flight metadata discovery", exc)
+
+    async def _perform_authorization(self) -> Any:
+        """Honor an explicitly configured scope at the redirect boundary.
+
+        The MCP SDK normally replaces the client-configured scope with every
+        scope advertised by protected-resource metadata. For providers that
+        expose both read and write scopes, this can silently widen a read-only
+        request. Re-apply the explicit scope just before building the URL.
+        """
+        configured_scope = getattr(self, "_hermes_configured_scope", None)
+        if configured_scope:
+            self.context.client_metadata.scope = configured_scope
+        return await super()._perform_authorization()
+
+    async def _perform_authorization_code_grant(self) -> tuple[str, str]:
+        """Run PKCE with a configurable base64url verifier length.
+
+        The upstream SDK uses the RFC-maximum 128 characters sampled from
+        the full unreserved alphabet. Most browser OAuth clients use
+        base64url entropy instead; providers can opt into that form via
+        ``oauth.pkce_verifier_bytes`` without changing the default for
+        every MCP server.
+        """
+        verifier_bytes = getattr(
+            self, "_hermes_pkce_verifier_bytes", None
+        )
+        if not verifier_bytes:
+            return await super()._perform_authorization_code_grant()
+
+        import base64
+        import hashlib
+        import secrets
+        from urllib.parse import urlencode, urljoin
+
+        if self.context.client_metadata.redirect_uris is None:
+            raise RuntimeError("No redirect URIs configured")
+        if not self.context.redirect_handler or not self.context.callback_handler:
+            raise RuntimeError("OAuth redirect/callback handler is missing")
+        if not self.context.client_info:
+            raise RuntimeError("No OAuth client info available")
+
+        code_verifier = base64.urlsafe_b64encode(
+            secrets.token_bytes(int(verifier_bytes))
+        ).decode().rstrip("=")
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).decode().rstrip("=")
+        state = secrets.token_urlsafe(32)
+
+        if (
+            self.context.oauth_metadata
+            and self.context.oauth_metadata.authorization_endpoint
+        ):
+            auth_endpoint = str(
+                self.context.oauth_metadata.authorization_endpoint
+            )
+        else:  # pragma: no cover - normal flows have discovered metadata
+            auth_base_url = self.context.get_authorization_base_url(
+                self.context.server_url
+            )
+            auth_endpoint = urljoin(auth_base_url, "/authorize")
+
+        auth_params = {
+            "response_type": "code",
+            "client_id": self.context.client_info.client_id,
+            "redirect_uri": str(
+                self.context.client_metadata.redirect_uris[0]
+            ),
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        if self.context.should_include_resource_param(
+            self.context.protocol_version
+        ):
+            auth_params["resource"] = self.context.get_resource_url()
+        if self.context.client_metadata.scope:
+            auth_params["scope"] = self.context.client_metadata.scope
+
+        await self.context.redirect_handler(
+            f"{auth_endpoint}?{urlencode(auth_params)}"
+        )
+        callback_result = await self.context.callback_handler()
+        if isinstance(callback_result, tuple):  # MCP 1.x
+            auth_code, returned_state = callback_result
+        else:  # MCP 2.x AuthorizationCodeResult (RFC 9207)
+            auth_code, returned_state = callback_result.code, callback_result.state
+            issuer = getattr(callback_result, "iss", None)
+            metadata = self.context.oauth_metadata
+            if metadata is not None:
+                expected_issuer = str(metadata.issuer)
+                issuer_required = getattr(metadata, "authorization_response_iss_parameter_supported", False)
+                if (issuer_required and not issuer) or (issuer and str(issuer) != expected_issuer):
+                    raise RuntimeError("OAuth authorization response issuer mismatch")
+        if (
+            returned_state is None
+            or not secrets.compare_digest(returned_state, state)
+        ):
+            raise RuntimeError("OAuth state parameter mismatch")
+        if not auth_code:
+            raise RuntimeError("No authorization code received")
+        return auth_code, code_verifier
+
+    async def _exchange_token_authorization_code(
+        self,
+        auth_code: str,
+        code_verifier: str,
+        *,
+        token_data: dict[str, Any] | None = None,
+    ) -> Any:
+        """Add an explicitly configured scope to providers that require it."""
+        data = dict(token_data or {})
+        if getattr(
+            self, "_hermes_include_scope_in_token_request", False
+        ):
+            configured_scope = getattr(
+                self, "_hermes_configured_scope", None
+            )
+            if configured_scope:
+                data["scope"] = configured_scope
+        # MCP 2.x removed the token_data keyword. Let the SDK build its
+        # request (including resource and client authentication), then add
+        # the explicitly configured form fields without coupling to that
+        # private method's former signature.
+        request = await super()._exchange_token_authorization_code(
+            auth_code, code_verifier
+        )
+        if not data:
+            return request
+        from urllib.parse import parse_qsl, urlencode
+
+        form = dict(parse_qsl(request.content.decode("utf-8"), keep_blank_values=True))
+        form.update(data)
+        headers = [(key, value) for key, value in request.headers.multi_items()
+                   if key.lower() != "content-length"]
+        return type(request)(
+            request.method, request.url, headers=headers,
+            content=urlencode(form, doseq=True).encode("utf-8"),
+            extensions=dict(request.extensions),
+        )
+
+    async def _handle_token_response(self, response: Any) -> None:
+        """Log only redacted request shape when a token endpoint rejects it."""
+        if not (200 <= getattr(response, "status_code", 200) < 300):
+            from urllib.parse import parse_qs
+
+            request = getattr(response, "request", None)
+            form_summary: dict[str, int] = {}
+            if request is not None:
+                try:
+                    parsed = parse_qs(
+                        request.content.decode("utf-8"),
+                        keep_blank_values=True,
+                    )
+                    form_summary = {
+                        key: len(values[0]) if values else 0
+                        for key, values in parsed.items()
+                    }
+                except Exception:  # pragma: no cover - diagnostics only
+                    pass
+            logger.warning(
+                "MCP OAuth '%s': token endpoint rejected request "
+                "status=%s url=%s content_type=%s form_value_lengths=%s",
+                self._hermes_server_name,
+                response.status_code,
+                str(request.url) if request is not None else "unknown",
+                response.headers.get("content-type"),
+                form_summary,
+            )
+        await super()._handle_token_response(response)
+
 
     async def _prefetch_oauth_metadata(self) -> None:
         """Fetch PRM + ASM from the well-known endpoints before the first request, via the SDK's own URL
@@ -313,7 +493,42 @@ class MCPOAuthManager:
             raise OAuthNonInteractiveError(
                 f"MCP OAuth for '{server_name}': non-interactive environment and no cached tokens found. "
                 f"Run `hermes mcp login {server_name}` interactively first to complete initial authorization.")
+        oauth_metadata_override = None
+        authorization_endpoint = cfg.get("authorization_endpoint")
+        token_endpoint = cfg.get("token_endpoint")
+        if authorization_endpoint or token_endpoint:
+            if not authorization_endpoint or not token_endpoint:
+                raise ValueError(
+                    "MCP OAuth endpoint override requires both "
+                    "oauth.authorization_endpoint and oauth.token_endpoint"
+                )
+            from urllib.parse import urlsplit
+            from mcp.shared.auth import OAuthMetadata
+
+            parsed = urlsplit(str(authorization_endpoint))
+            issuer = cfg.get("issuer") or f"{parsed.scheme}://{parsed.netloc}"
+            metadata_dict: dict[str, Any] = {
+                "issuer": issuer,
+                "authorization_endpoint": authorization_endpoint,
+                "token_endpoint": token_endpoint,
+            }
+            for field_name in (
+                "registration_endpoint",
+                "revocation_endpoint",
+                "scopes_supported",
+                "response_types_supported",
+                "grant_types_supported",
+                "token_endpoint_auth_methods_supported",
+                "code_challenge_methods_supported",
+            ):
+                if cfg.get(field_name) is not None:
+                    metadata_dict[field_name] = cfg[field_name]
+            oauth_metadata_override = OAuthMetadata.model_validate(metadata_dict)
+
         return _HERMES_PROVIDER_CLS(
+            oauth_metadata_override=oauth_metadata_override, configured_scope=cfg.get("scope"),
+            pkce_verifier_bytes=cfg.get("pkce_verifier_bytes"),
+            include_scope_in_token_request=bool(cfg.get("include_scope_in_token_request", False)),
             server_name=server_name, preregistered=bool(cfg.get("client_id")), server_url=entry.server_url,
             **build_provider_kwargs(cfg, storage, ssh_proxy_hint=False))
 

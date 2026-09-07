@@ -84,6 +84,146 @@ def test_hermes_provider_subclass_exists():
 
 
 @pytest.mark.asyncio
+async def test_explicit_oauth_endpoints_override_discovery_fallback(tmp_path, monkeypatch):
+    """Configured endpoints prevent a provider from falling back to /authorize."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    provider = MCPOAuthManager().get_or_build_provider(
+        "ibkr-like",
+        "https://api.example.com/v1/api/mcp-public",
+        {
+            "client_id": "pre-registered-client",
+            "authorization_endpoint": "https://api.example.com/oauth2/authorize",
+            "token_endpoint": "https://api.example.com/oauth2/token",
+            "scope": "mcp.read",
+        },
+    )
+    await provider._initialize()
+
+    assert str(provider.context.oauth_metadata.authorization_endpoint) == (
+        "https://api.example.com/oauth2/authorize"
+    )
+    assert str(provider.context.oauth_metadata.token_endpoint) == (
+        "https://api.example.com/oauth2/token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_scope_is_reapplied_before_authorization(tmp_path, monkeypatch):
+    """A configured read-only scope must not widen to all PRM scopes."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    provider = MCPOAuthManager().get_or_build_provider(
+        "scope-pin",
+        "https://api.example.com/mcp",
+        {"client_id": "client", "scope": "mcp.read"},
+    )
+    provider.context.client_metadata.scope = "mcp.read mcp.write"
+    captured = {}
+
+    async def _fake_perform_authorization(self):
+        captured["scope"] = self.context.client_metadata.scope
+        return "sentinel"
+
+    monkeypatch.setattr(
+        OAuthClientProvider,
+        "_perform_authorization",
+        _fake_perform_authorization,
+    )
+    assert await provider._perform_authorization() == "sentinel"
+    assert captured["scope"] == "mcp.read"
+
+
+@pytest.mark.asyncio
+async def test_configurable_pkce_uses_64_char_base64url_verifier(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    from urllib.parse import parse_qs, urlsplit
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    provider = MCPOAuthManager().get_or_build_provider(
+        "pkce-shape",
+        "https://api.example.com/mcp",
+        {
+            "client_id": "client",
+            "scope": "mcp.read",
+            "authorization_endpoint": "https://api.example.com/oauth2/authorize",
+            "token_endpoint": "https://api.example.com/oauth2/token",
+            "pkce_verifier_bytes": 48,
+        },
+    )
+    await provider._initialize()
+    captured = {}
+
+    async def redirect_handler(url):
+        captured["url"] = url
+
+    async def callback_handler():
+        state = parse_qs(urlsplit(captured["url"]).query)["state"][0]
+        return "authorization-code", state
+
+    provider.context.redirect_handler = redirect_handler
+    provider.context.callback_handler = callback_handler
+    _, verifier = await provider._perform_authorization_code_grant()
+
+    assert len(verifier) == 64
+    assert set(verifier) <= set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    )
+    query = parse_qs(urlsplit(captured["url"]).query)
+    assert len(query["code_challenge"][0]) == 43
+    assert query["scope"] == ["mcp.read"]
+
+
+@pytest.mark.asyncio
+async def test_scope_can_be_repeated_on_token_exchange(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    from urllib.parse import parse_qs
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    provider = MCPOAuthManager().get_or_build_provider(
+        "token-scope",
+        "https://api.example.com/mcp",
+        {
+            "client_id": "client",
+            "scope": "mcp.read",
+            "authorization_endpoint": "https://api.example.com/oauth2/authorize",
+            "token_endpoint": "https://api.example.com/oauth2/token",
+            "include_scope_in_token_request": True,
+        },
+    )
+    await provider._initialize()
+    request = await provider._exchange_token_authorization_code(
+        "authorization-code", "code-verifier"
+    )
+    form = parse_qs(request.content.decode())
+    assert form["scope"] == ["mcp.read"]
+    assert form["code"] == ["authorization-code"]
+    assert form["code_verifier"] == ["code-verifier"]
+    assert form["client_id"] == ["client"]
+    assert int(request.headers["content-length"]) == len(request.content)
+    assert request.headers["content-type"].startswith("application/x-www-form-urlencoded")
+    # An adjacent private-API compatibility case: explicit extra form data.
+    extra = await provider._exchange_token_authorization_code(
+        "authorization-code", "code-verifier", token_data={"audience": "test-api"}
+    )
+    assert parse_qs(extra.content.decode())["audience"] == ["test-api"]
+    assert int(extra.headers["content-length"]) == len(extra.content)
+
+
+@pytest.mark.asyncio
 async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     """When the tokens file mtime changes, provider._initialized flips False.
 
