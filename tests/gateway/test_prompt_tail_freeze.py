@@ -208,6 +208,30 @@ class TestSessionContextPin:
         # immunizing against renderer nondeterminism.
         assert second is first
 
+    def test_telegram_topic_context_is_injected_and_busts_pin(self, monkeypatch):
+        runner = _make_runner()
+        ctx = _make_context(
+            platform=Platform.TELEGRAM,
+            chat_name="lgd & iKun",
+            chat_type="group",
+            thread_id="2",
+            parent_chat_id=None,
+            guild_id=None,
+        )
+        current = {"value": "## Topic Context\n\nFirst version"}
+        monkeypatch.setattr(
+            "gateway.run_agent_cache.load_topic_context_block",
+            lambda **_kwargs: current["value"],
+        )
+
+        first = runner._pinned_session_context_prompt(ctx, False, "sk-topic")  # noqa: SLF001
+        assert first.endswith("## Topic Context\n\nFirst version")
+
+        current["value"] = "## Topic Context\n\nUpdated version"
+        second = runner._pinned_session_context_prompt(ctx, False, "sk-topic")  # noqa: SLF001
+        assert second.endswith("## Topic Context\n\nUpdated version")
+        assert second != first
+
 
 # ---------------------------------------------------------------------------
 # 3. Two-turn byte test: composed system prompt sha256 + codex cache key

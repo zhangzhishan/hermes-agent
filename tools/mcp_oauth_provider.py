@@ -83,9 +83,23 @@ class HermesProviderMixin:
 
     _hermes_logger: logging.Logger = logger
 
-    def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
+    def __init__(
+        self,
+        *args: Any,
+        token_user_agent: str | None = None,
+        oauth_flow: str = "browser",
+        oauth_metadata_override: Any = None,
+        configured_scope: str | None = None,
+        pkce_verifier_bytes: int | None = None,
+        include_scope_in_token_request: bool = False,
+        **kwargs: Any,
+    ):
         super().__init__(*args, **kwargs)
         self._hermes_oauth_flow = oauth_flow
+        self._hermes_oauth_metadata_override = oauth_metadata_override
+        self._hermes_configured_scope = configured_scope
+        self._hermes_pkce_verifier_bytes = pkce_verifier_bytes
+        self._hermes_include_scope_in_token_request = include_scope_in_token_request
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
@@ -100,6 +114,20 @@ class HermesProviderMixin:
                 "MCP device authorization requires `hermes mcp login <server> --flow device`; "
                 "background reconnects cannot start a device login")
         self._tolerate_missing_iss_for_known_server()
+        metadata_override = getattr(self, "_hermes_oauth_metadata_override", None)
+        if metadata_override is not None:
+            # The SDK's 401 path always performs discovery and may replace the
+            # pinned metadata. Re-apply it at the last boundary before both
+            # authorization and token exchange, then enforce issuer binding
+            # against the endpoint that will actually receive credentials.
+            self.context.oauth_metadata = metadata_override
+            enforce_refresh_token_issuer(self.context)
+        configured_scope = getattr(self, "_hermes_configured_scope", None)
+        if configured_scope:
+            # Protected-resource discovery may advertise broader scopes than
+            # the operator explicitly requested. Re-pin the configured scope
+            # at the authorization boundary rather than silently widening it.
+            self.context.client_metadata.scope = configured_scope
         return await super()._perform_authorization()
 
     def _tolerate_missing_iss_for_known_server(self) -> None:
@@ -141,9 +169,100 @@ class HermesProviderMixin:
         if HermesTokenStorage._coerce_secret_auth_method(data):
             self.context.client_info = OAuthClientInformationFull.model_validate(data)
 
+    async def _perform_authorization_code_grant(self) -> tuple[str, str]:
+        """Run the SDK browser flow, optionally using a base64url PKCE verifier.
+
+        The SDK defaults to the RFC-maximum 128-character verifier. A provider
+        can opt into the common 64-character base64url shape with
+        ``oauth.pkce_verifier_bytes: 48``; all other providers retain the SDK
+        implementation unchanged.
+        """
+        verifier_bytes = getattr(self, "_hermes_pkce_verifier_bytes", None)
+        if not verifier_bytes:
+            return await super()._perform_authorization_code_grant()
+
+        import base64
+        import hashlib
+        import secrets
+        from urllib.parse import urlencode, urljoin
+
+        from mcp.client.auth.exceptions import OAuthFlowError
+        from mcp.client.auth.utils import validate_authorization_response_iss
+
+        if self.context.client_metadata.redirect_uris is None:
+            raise OAuthFlowError("No redirect URIs provided for authorization code grant")
+        if not self.context.redirect_handler:
+            raise OAuthFlowError("No redirect handler provided for authorization code grant")
+        if not self.context.callback_handler:
+            raise OAuthFlowError("No callback handler provided for authorization code grant")
+        if not self.context.client_info:
+            raise OAuthFlowError("No client info available for authorization")
+
+        code_verifier = base64.urlsafe_b64encode(
+            secrets.token_bytes(int(verifier_bytes))
+        ).decode().rstrip("=")
+        code_challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(code_verifier.encode()).digest()
+        ).decode().rstrip("=")
+        state = secrets.token_urlsafe(32)
+
+        if self.context.oauth_metadata and self.context.oauth_metadata.authorization_endpoint:
+            auth_endpoint = str(self.context.oauth_metadata.authorization_endpoint)
+        else:
+            auth_base_url = self.context.get_authorization_base_url(self.context.server_url)
+            auth_endpoint = urljoin(auth_base_url, "/authorize")
+
+        auth_params = {
+            "response_type": "code",
+            "client_id": self.context.client_info.client_id,
+            "redirect_uri": str(self.context.client_metadata.redirect_uris[0]),
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        if self.context.should_include_resource_param(self.context.protocol_version):
+            auth_params["resource"] = self.context.get_resource_url()
+        if self.context.client_metadata.scope:
+            auth_params["scope"] = self.context.client_metadata.scope
+            if "offline_access" in self.context.client_metadata.scope.split():
+                auth_params["prompt"] = "consent"
+
+        await self.context.redirect_handler(f"{auth_endpoint}?{urlencode(auth_params)}")
+        result = await self.context.callback_handler()
+        if result.state is None or not secrets.compare_digest(result.state, state):
+            raise OAuthFlowError(f"State parameter mismatch: {result.state} != {state}")
+        validate_authorization_response_iss(result.iss, self.context.oauth_metadata)
+        if not result.code:
+            raise OAuthFlowError("No authorization code received")
+        return result.code, code_verifier
+
     async def _exchange_token_authorization_code(self, *args: Any, **kwargs: Any):
         self._coerce_client_secret_post()
-        return self._prepare_token_request(await super()._exchange_token_authorization_code(*args, **kwargs))
+        request = await super()._exchange_token_authorization_code(*args, **kwargs)
+        if getattr(self, "_hermes_include_scope_in_token_request", False):
+            configured_scope = getattr(self, "_hermes_configured_scope", None)
+            if configured_scope:
+                from urllib.parse import parse_qsl, urlencode
+
+                form = [
+                    (key, value)
+                    for key, value in parse_qsl(
+                        request.content.decode("utf-8"), keep_blank_values=True
+                    )
+                    if key != "scope"
+                ]
+                form.append(("scope", configured_scope))
+                headers = dict(request.headers)
+                # Let the request class recompute the length after form changes.
+                headers.pop("content-length", None)
+                request = type(request)(
+                    request.method,
+                    request.url,
+                    content=urlencode(form).encode("utf-8"),
+                    headers=headers,
+                    extensions=dict(request.extensions),
+                )
+        return self._prepare_token_request(request)
 
     # Locked descriptor while this provider owns the refresh fence; cleared by
     # _hermes_release_refresh_fence. Never shared across instances.
@@ -329,7 +448,11 @@ class HermesProviderMixin:
         await super()._initialize()
         storage = self.context.storage
         from tools.mcp_oauth import HermesTokenStorage
-        if isinstance(storage, HermesTokenStorage) and self.context.oauth_metadata is None:
+        metadata_override = getattr(self, "_hermes_oauth_metadata_override", None)
+        if metadata_override is not None:
+            # Explicit operator/provider pins outrank stale discovered metadata.
+            self.context.oauth_metadata = metadata_override
+        elif isinstance(storage, HermesTokenStorage) and self.context.oauth_metadata is None:
             meta = storage.load_oauth_metadata()
             if meta is not None:
                 self.context.oauth_metadata = meta
@@ -499,6 +622,39 @@ def build_provider_kwargs(cfg: dict, storage: "HermesTokenStorage", *, ssh_proxy
     client_metadata = mo._build_client_metadata(cfg)
     mo._maybe_preregister_client(storage, cfg, client_metadata)
     redirect_uri = (cfg.get("redirect_uri") or None) if ssh_proxy_hint else None
+
+    oauth_metadata_override = None
+    authorization_endpoint = cfg.get("authorization_endpoint")
+    token_endpoint = cfg.get("token_endpoint")
+    if authorization_endpoint or token_endpoint:
+        if not authorization_endpoint or not token_endpoint:
+            raise ValueError(
+                "MCP OAuth endpoint override requires both "
+                "oauth.authorization_endpoint and oauth.token_endpoint"
+            )
+        from urllib.parse import urlsplit
+        from mcp.shared.auth import OAuthMetadata
+
+        parsed = urlsplit(str(authorization_endpoint))
+        issuer = cfg.get("issuer") or f"{parsed.scheme}://{parsed.netloc}"
+        metadata_dict: dict[str, Any] = {
+            "issuer": issuer,
+            "authorization_endpoint": authorization_endpoint,
+            "token_endpoint": token_endpoint,
+        }
+        for field_name in (
+            "registration_endpoint",
+            "revocation_endpoint",
+            "scopes_supported",
+            "response_types_supported",
+            "grant_types_supported",
+            "token_endpoint_auth_methods_supported",
+            "code_challenge_methods_supported",
+        ):
+            if cfg.get(field_name) is not None:
+                metadata_dict[field_name] = cfg[field_name]
+        oauth_metadata_override = OAuthMetadata.model_validate(metadata_dict)
+
     return {
         "client_metadata": client_metadata,
         "storage": storage,
@@ -508,4 +664,10 @@ def build_provider_kwargs(cfg: dict, storage: "HermesTokenStorage", *, ssh_proxy
         "callback_handler": mo._make_callback_waiter(port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))),
         "token_user_agent": mo.token_request_user_agent(cfg),
         "oauth_flow": cfg.get("flow", "browser"),
+        "oauth_metadata_override": oauth_metadata_override,
+        "configured_scope": cfg.get("scope"),
+        "pkce_verifier_bytes": cfg.get("pkce_verifier_bytes"),
+        "include_scope_in_token_request": bool(
+            cfg.get("include_scope_in_token_request", False)
+        ),
         **mo.cimd_provider_kwargs(cfg)}

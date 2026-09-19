@@ -852,7 +852,9 @@ def _make_callback_waiter(port: int, cimd_url: str | None = None, timeout: float
         if dashboard_flow is not None and not port:
             # Dashboard flow speaks the legacy tuple; normalize to one shape. A pinned loopback port
             # (pre-registered client) listens locally instead; the dashboard only shows the URL.
-            return _authorization_code_result(*await dashboard_flow.wait_for_callback())
+            return _authorization_code_result(
+                *await dashboard_flow.wait_for_callback(timeout=timeout)
+            )
         # The SDK entered the authorization-code flow, so any cached token is unusable. Reject BEFORE
         # binding: binding would block for the full timeout and collide with the TIME_WAIT port on retry.
         # Reject before binding the callback listener in non-interactive contexts. Reaching here means the
@@ -1060,6 +1062,25 @@ def _resolve_redirect_uri(cfg: dict, port: int) -> str:
 _FIGMA_DCR_CLIENT_NAME = "Claude Code"
 _FIGMA_DEFAULT_SCOPE = "mcp:connect"
 
+# Interactive Brokers' public MCP publishes OAuth endpoints under /oauth2
+# while its MCP resource lives under /v1/api.  Pin the verified metadata and
+# conservative read-only request shape for that one hosted endpoint; explicit
+# user config always wins.
+_IBKR_DEFAULT_SCOPE = "mcp.read"
+
+
+def _is_ibkr_public_mcp(
+    server_name: str | None = None,
+    server_url: str | None = None,
+) -> bool:
+    """True for Interactive Brokers' hosted public MCP endpoint."""
+    url = (server_url or "").lower().rstrip("/")
+    name = (server_name or "").lower()
+    return (
+        "api.ibkr.com/v1/api/mcp-public" in url
+        or (name == "ibkr" and "api.ibkr.com" in url)
+    )
+
 
 def _is_figma_remote_mcp(server_name: str | None = None, server_url: str | None = None) -> bool:
     """True when this MCP server is Figma's hosted remote endpoint."""
@@ -1074,6 +1095,14 @@ def _is_figma_remote_mcp(server_name: str | None = None, server_url: str | None 
 def apply_oauth_provider_defaults(cfg: dict, *, server_name: str = "", server_url: str | None = None) -> dict:
     """Mutate *cfg* with provider-specific OAuth workarounds (before building client metadata /
     pre-registering); returns *cfg*. Only fills keys the user left unset — explicit values win."""
+    if _is_ibkr_public_mcp(server_name, server_url):
+        if not cfg.get("scope"):
+            cfg["scope"] = _IBKR_DEFAULT_SCOPE
+        cfg.setdefault("authorization_endpoint", "https://api.ibkr.com/oauth2/authorize")
+        cfg.setdefault("token_endpoint", "https://api.ibkr.com/oauth2/api/v1/token")
+        cfg.setdefault("issuer", "https://api.ibkr.com")
+        cfg.setdefault("pkce_verifier_bytes", 48)
+        cfg.setdefault("include_scope_in_token_request", True)
     if _is_figma_remote_mcp(server_name, server_url):
         if not cfg.get("client_name"):
             cfg["client_name"] = _FIGMA_DCR_CLIENT_NAME

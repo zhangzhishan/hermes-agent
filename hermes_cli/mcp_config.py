@@ -812,6 +812,20 @@ def cmd_mcp_test(args):
     return 0
 
 
+def _oauth_probe_connect_timeout(server_config: dict) -> float:
+    """Keep the outer MCP probe alive for the configured OAuth callback window."""
+    try:
+        connect_timeout = float(server_config.get("connect_timeout"))
+    except (TypeError, ValueError):
+        connect_timeout = 0.0
+    oauth_cfg = server_config.get("oauth") or {}
+    try:
+        callback_timeout = float(oauth_cfg.get("timeout", 300) or 300)
+    except (TypeError, ValueError):
+        callback_timeout = 300.0
+    return max(connect_timeout, callback_timeout + 15.0, 315.0)
+
+
 def _reauth_oauth_server(name: str, server_config: dict, *, flow: str | None = None) -> bool:
     """Force a fresh OAuth flow for one server. Returns True on success.
 
@@ -850,17 +864,15 @@ def _reauth_oauth_server(name: str, server_config: dict, *, flow: str | None = N
     try:
         from tools.mcp_oauth import force_interactive_oauth
 
-        try:
-            _login_connect_timeout = float(server_config.get("connect_timeout"))
-        except (TypeError, ValueError):
-            _login_connect_timeout = 0.0
         if selected_flow == "device":
             from tools.mcp_oauth_device import login_device
             asyncio.run(login_device(name, url, oauth_cfg))
         probe_config = {**server_config, "oauth": {**oauth_cfg, "flow": selected_flow}}
         with force_interactive_oauth():
             tools = _probe_single_server(
-                name, probe_config, connect_timeout=max(_login_connect_timeout, 315.0)
+                name,
+                probe_config,
+                connect_timeout=_oauth_probe_connect_timeout(server_config),
             )
         # A clean probe is NOT proof of authentication: some servers (e.g. Google Drive) serve
         # initialize + tools/list without auth, so the flow may have failed (e.g. DCR 400 for

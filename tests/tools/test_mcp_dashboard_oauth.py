@@ -121,6 +121,23 @@ def test_mcp_oauth_helpers_use_dashboard_flow_without_loopback_port():
     assert flow.authorization_url == "https://idp.example/authorize?state=state-4"
 
 
+def test_dashboard_callback_waiter_honors_configured_timeout(monkeypatch):
+    from tools.mcp_oauth import _make_callback_waiter
+
+    seen = {}
+
+    class FakeFlow:
+        async def wait_for_callback(self, timeout=300.0):
+            seen["timeout"] = timeout
+            return "code", "state", None
+
+    monkeypatch.setattr("tools.mcp_oauth.get_dashboard_oauth_flow", lambda: FakeFlow())
+    result = asyncio.run(_make_callback_waiter(0, timeout=900.0)())
+
+    assert (result.code, result.state) == ("code", "state")
+    assert seen["timeout"] == 900.0
+
+
 def _flow(flow_id: str):
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow
 
