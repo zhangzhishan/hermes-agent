@@ -615,7 +615,9 @@ class GatewayAgentCacheMixin:
 
     def _pinned_session_context_prompt(self, context, redact_pii: bool, session_key: Optional[str]) -> str:
         """Session-context prompt pinned per session: key hit → pinned bytes reused VERBATIM (immune
-        to renderer nondeterminism); key miss → re-render and re-pin (rename, topic edit, /sethome)."""
+        to renderer nondeterminism and mid-conversation topic-file edits); key miss → re-render and
+        re-pin after session metadata changes such as a rename or /sethome. Topic changes apply to
+        the next conversation."""
         _eph_key = self._ephemeral_change_key(context, redact_pii)
         _pin_state = self._peek_session_state(session_key) if session_key else None
         _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
