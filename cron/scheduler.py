@@ -1375,6 +1375,7 @@ class _CronJobConfig:
     model: str
     model_cfg: Any
     cron_default_provider: str
+    use_creation_snapshots: bool = True
 
 
 def _snapshot_pin(job: dict, axis: str, current: str, job_id: str) -> str:
@@ -1402,6 +1403,7 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
     _cron_default_provider = ""
     _cfg: dict = {}
     _model_cfg: Any = {}
+    _use_creation_snapshots = True
     try:
         from hermes_cli.config_effective import load_user_config_effective
         _cfg_path = str(_get_hermes_home() / "config.yaml")
@@ -1414,13 +1416,21 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             if isinstance(_cron_cfg_for_model, dict):
                 _cron_default_model = str(_cron_cfg_for_model.get("model") or "").strip()
                 _cron_default_provider = str(_cron_cfg_for_model.get("model_provider") or "").strip()
+                _use_creation_snapshots = (
+                    _cron_cfg_for_model.get("model_drift_guard", True) is not False
+                )
             if not job.get("model"):
                 if _cron_default_model:
                     model = _cron_default_model
                 else:
                     _, _global_model = resolve_cron_model_drift_defaults(
                         _cfg, environ={"HERMES_MODEL": cron_env_setting("HERMES_MODEL")})
-                    model = _snapshot_pin(job, "model", _global_model, job_id) or _global_model or model
+                    snapshot_model = (
+                        _snapshot_pin(job, "model", _global_model, job_id)
+                        if _use_creation_snapshots
+                        else ""
+                    )
+                    model = snapshot_model or _global_model or model
     except Exception as e:
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -1442,7 +1452,13 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
         _net_cfg = _cfg.get("network", {})
         if isinstance(_net_cfg, dict) and _net_cfg.get("force_ipv4"):
             apply_ipv4_preference(force=True)
-    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider)
+    return _CronJobConfig(
+        _cfg,
+        model,
+        _model_cfg,
+        _cron_default_provider,
+        use_creation_snapshots=_use_creation_snapshots,
+    )
 
 
 def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
@@ -1542,8 +1558,13 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         global_provider = (
             str(jc.model_cfg.get("provider") or "").strip() if isinstance(jc.model_cfg, dict) else "")
         # None (not the config provider) keeps the legacy no-snapshot path resolving from persisted
-        # config exactly as before.
-        requested = _snapshot_pin(job, "provider", global_provider, job_id) or None
+        # config exactly as before. Operators who explicitly disable the drift guard choose that
+        # live-default path even when the job carries an older creation snapshot.
+        requested = (
+            _snapshot_pin(job, "provider", global_provider, job_id)
+            if jc.use_creation_snapshots
+            else ""
+        ) or None
     try:
         # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
         # and resurrect stale providers for unpinned jobs.

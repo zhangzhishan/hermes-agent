@@ -46,6 +46,41 @@ def test_ibkr_defaults_pin_read_only_oauth_shape():
     assert "client_name" not in cfg
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.ibkr.com.attacker.example/v1/api/mcp-public",
+        "https://example.com/api.ibkr.com/v1/api/mcp-public",
+        "http://api.ibkr.com/v1/api/mcp-public",
+        "https://api.ibkr.com/v1/api/not-mcp-public",
+    ],
+)
+def test_ibkr_defaults_reject_lookalike_urls(url):
+    from tools.mcp_oauth import apply_oauth_provider_defaults
+
+    cfg = {}
+    apply_oauth_provider_defaults(cfg, server_name="ibkr", server_url=url)
+    assert "scope" not in cfg
+    assert "authorization_endpoint" not in cfg
+
+
+def test_endpoint_override_requires_preregistered_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _interactive(monkeypatch)
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    with pytest.raises(ValueError, match="pre-registered oauth.client_id"):
+        MCPOAuthManager().get_or_build_provider(
+            "override",
+            "https://mcp.example/resource",
+            {
+                "authorization_endpoint": "https://idp.example/authorize",
+                "token_endpoint": "https://idp.example/token",
+            },
+        )
+
+
 @pytest.mark.asyncio
 async def test_ibkr_provider_uses_pinned_metadata_and_scope(tmp_path, monkeypatch):
     provider = _provider(tmp_path, monkeypatch)
@@ -90,6 +125,59 @@ async def test_ibkr_provider_uses_pinned_metadata_and_scope(tmp_path, monkeypatc
     assert captured["authorization_endpoint"] == (
         "https://api.ibkr.com/oauth2/authorize"
     )
+
+
+@pytest.mark.asyncio
+async def test_pinned_endpoint_rejects_client_bound_to_other_issuer(tmp_path, monkeypatch):
+    from mcp.client.auth.exceptions import OAuthFlowError
+
+    provider = _provider(tmp_path, monkeypatch)
+    await provider._initialize()
+    provider.context.client_info = provider.context.client_info.model_copy(
+        update={"issuer": "https://discovered.example"}
+    )
+
+    with pytest.raises(OAuthFlowError, match="does not match"):
+        await provider._perform_authorization()
+
+
+@pytest.mark.asyncio
+async def test_pinned_metadata_preserves_required_callback_issuer(tmp_path, monkeypatch):
+    from mcp.client.auth.exceptions import OAuthFlowError
+    from mcp.shared.auth import AuthorizationCodeResult
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _interactive(monkeypatch)
+    reset_manager_for_tests()
+    provider = MCPOAuthManager().get_or_build_provider(
+        "strict-issuer",
+        "https://mcp.example/resource",
+        {
+            "client_id": "client",
+            "scope": "read",
+            "authorization_endpoint": "https://idp.example/authorize",
+            "token_endpoint": "https://idp.example/token",
+            "authorization_response_iss_parameter_supported": True,
+            "pkce_verifier_bytes": 48,
+            "redirect_port": 49201,
+        },
+    )
+    await provider._initialize()
+    captured = {}
+
+    async def redirect(url):
+        captured["url"] = url
+
+    async def callback():
+        state = parse_qs(urlsplit(captured["url"]).query)["state"][0]
+        return AuthorizationCodeResult(code="code", state=state, iss=None)
+
+    provider.context.redirect_handler = redirect
+    provider.context.callback_handler = callback
+    assert provider.context.oauth_metadata.authorization_response_iss_parameter_supported is True
+    with pytest.raises(OAuthFlowError):
+        await provider._perform_authorization_code_grant()
 
 
 @pytest.mark.asyncio

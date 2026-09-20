@@ -1,6 +1,10 @@
 from pathlib import Path
 
-from gateway.topic_context import load_topic_context_block, slugify_topic_chat_name
+from gateway.topic_context import (
+    load_topic_context_block,
+    resolve_topic_context_path,
+    slugify_topic_chat_name,
+)
 
 
 def test_slugify_topic_chat_name_normalizes_ascii_words():
@@ -20,9 +24,27 @@ def test_load_topic_context_block_returns_none_without_thread_id(tmp_path: Path)
     )
 
 
-def test_load_topic_context_block_loads_existing_telegram_summary(tmp_path: Path):
+def test_canonical_path_uses_immutable_chat_and_thread_ids(tmp_path: Path):
     workspace = tmp_path / "workspace"
-    topic_file = workspace / "topics" / "telegram" / "lgd-ikun" / "thread-2.md"
+    path = resolve_topic_context_path(
+        platform="telegram",
+        chat_id="-1003784358394",
+        thread_id="2",
+        chat_name="renameable group",
+        workspace_root=workspace,
+    )
+    assert path == (
+        workspace
+        / "topics"
+        / "telegram"
+        / "-1003784358394"
+        / "thread-2.md"
+    )
+
+
+def test_load_topic_context_block_loads_canonical_telegram_summary(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    topic_file = workspace / "topics" / "telegram" / "123" / "thread-2.md"
     topic_file.parent.mkdir(parents=True)
     topic_file.write_text("Thread summary\n\nImportant context.", encoding="utf-8")
 
@@ -39,6 +61,34 @@ def test_load_topic_context_block_loads_existing_telegram_summary(tmp_path: Path
     assert str(topic_file) in block
     assert "Thread summary" in block
     assert "Important context." in block
+
+
+def test_legacy_slug_path_requires_matching_chat_id_frontmatter(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    topic_file = workspace / "topics" / "telegram" / "lgd-ikun" / "thread-2.md"
+    topic_file.parent.mkdir(parents=True)
+    topic_file.write_text(
+        '---\nchat_id: "123"\nthread_id: 2\n---\n\nPrivate context.',
+        encoding="utf-8",
+    )
+
+    matching = load_topic_context_block(
+        platform="telegram",
+        chat_id="123",
+        thread_id="2",
+        chat_name="lgd & iKun",
+        workspace_root=workspace,
+    )
+    other_chat = load_topic_context_block(
+        platform="telegram",
+        chat_id="999",
+        thread_id="2",
+        chat_name="lgd & iKun",
+        workspace_root=workspace,
+    )
+
+    assert matching is not None and "Private context." in matching
+    assert other_chat is None
 
 
 def test_load_topic_context_block_truncates_long_file(tmp_path: Path):
@@ -58,3 +108,17 @@ def test_load_topic_context_block_truncates_long_file(tmp_path: Path):
     assert block is not None
     assert "AAAAAAAAAA" in block
     assert "truncated" in block.lower()
+
+
+def test_invalid_utf8_is_ignored(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    topic_file = workspace / "topics" / "telegram" / "123" / "thread-9.md"
+    topic_file.parent.mkdir(parents=True)
+    topic_file.write_bytes(b"\xff\xfe")
+
+    assert load_topic_context_block(
+        platform="telegram",
+        chat_id="123",
+        thread_id="9",
+        workspace_root=workspace,
+    ) is None

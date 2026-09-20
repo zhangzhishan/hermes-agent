@@ -208,7 +208,7 @@ class TestSessionContextPin:
         # immunizing against renderer nondeterminism.
         assert second is first
 
-    def test_telegram_topic_context_is_injected_and_busts_pin(self, monkeypatch):
+    def test_telegram_topic_context_is_frozen_for_active_session(self, monkeypatch):
         runner = _make_runner()
         ctx = _make_context(
             platform=Platform.TELEGRAM,
@@ -218,19 +218,22 @@ class TestSessionContextPin:
             parent_chat_id=None,
             guild_id=None,
         )
-        current = {"value": "## Topic Context\n\nFirst version"}
-        monkeypatch.setattr(
-            "gateway.run_agent_cache.load_topic_context_block",
-            lambda **_kwargs: current["value"],
-        )
+        current = {"value": "## Topic Context\n\nFirst version", "calls": 0}
+
+        def load(**_kwargs):
+            current["calls"] += 1
+            return current["value"]
+
+        monkeypatch.setattr("gateway.run_agent_cache.load_topic_context_block", load)
 
         first = runner._pinned_session_context_prompt(ctx, False, "sk-topic")  # noqa: SLF001
         assert first.endswith("## Topic Context\n\nFirst version")
 
         current["value"] = "## Topic Context\n\nUpdated version"
         second = runner._pinned_session_context_prompt(ctx, False, "sk-topic")  # noqa: SLF001
-        assert second.endswith("## Topic Context\n\nUpdated version")
-        assert second != first
+        assert second is first
+        assert "Updated version" not in second
+        assert current["calls"] == 1
 
 
 # ---------------------------------------------------------------------------

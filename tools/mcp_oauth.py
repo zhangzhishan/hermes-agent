@@ -1073,12 +1073,17 @@ def _is_ibkr_public_mcp(
     server_name: str | None = None,
     server_url: str | None = None,
 ) -> bool:
-    """True for Interactive Brokers' hosted public MCP endpoint."""
-    url = (server_url or "").lower().rstrip("/")
-    name = (server_name or "").lower()
+    """True only for Interactive Brokers' exact HTTPS public MCP endpoint."""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(server_url or "")
+    except ValueError:
+        return False
     return (
-        "api.ibkr.com/v1/api/mcp-public" in url
-        or (name == "ibkr" and "api.ibkr.com" in url)
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower() == "api.ibkr.com"
+        and parsed.path.rstrip("/") == "/v1/api/mcp-public"
     )
 
 

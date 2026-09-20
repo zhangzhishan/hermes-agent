@@ -616,6 +616,11 @@ class GatewayAgentCacheMixin:
     def _pinned_session_context_prompt(self, context, redact_pii: bool, session_key: Optional[str]) -> str:
         """Session-context prompt pinned per session: key hit → pinned bytes reused VERBATIM (immune
         to renderer nondeterminism); key miss → re-render and re-pin (rename, topic edit, /sethome)."""
+        _eph_key = self._ephemeral_change_key(context, redact_pii)
+        _pin_state = self._peek_session_state(session_key) if session_key else None
+        _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
+        if _eph_pin is not None and _eph_pin[0] == _eph_key:
+            return _eph_pin[1]
         src = context.source
         topic_context = load_topic_context_block(
             platform=src.platform,
@@ -623,13 +628,6 @@ class GatewayAgentCacheMixin:
             thread_id=src.thread_id,
             chat_name=src.chat_name,
         )
-        _eph_key = self._ephemeral_change_key(
-            context, redact_pii, topic_context=topic_context
-        )
-        _pin_state = self._peek_session_state(session_key) if session_key else None
-        _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
-        if _eph_pin is not None and _eph_pin[0] == _eph_key:
-            return _eph_pin[1]
         text = build_session_context_prompt(context, redact_pii=redact_pii)
         if topic_context:
             text = (text + "\n\n" + topic_context).strip()
@@ -638,9 +636,7 @@ class GatewayAgentCacheMixin:
         return text
 
     @staticmethod
-    def _ephemeral_change_key(
-        context, redact_pii: bool, *, topic_context: Optional[str] = None
-    ) -> str:
+    def _ephemeral_change_key(context, redact_pii: bool) -> str:
         """Hash the exact inputs ``build_session_context_prompt`` renders. Invariant
         (test_prompt_tail_freeze.py): any input whose change alters the rendered bytes MUST appear
         here — omission means a stale pinned prompt; extras only re-render."""
@@ -683,7 +679,7 @@ class GatewayAgentCacheMixin:
                 (p.value, _s(getattr(hc, "name", "")), _s(getattr(hc, "chat_id", "")))
                 for p, hc in context.home_channels.items()
             ),
-            bool(redact_pii), home_display, str(topic_context or ""),
+            bool(redact_pii), home_display,
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 

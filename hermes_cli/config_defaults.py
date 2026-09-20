@@ -1757,6 +1757,11 @@ DEFAULT_CONFIG = {
         # Inference provider paired with cron.model (NOT the scheduler provider below). "" = resolve
         # from global config.
         "model_provider": "",
+        # Creation snapshots protect unpinned jobs from silently changing cost/behavior when the
+        # global model changes. Set false only when the operator explicitly wants every unpinned
+        # job to follow the live model.default/provider on each run; explicit per-job and cron.*
+        # fleet pins still win.
+        "model_drift_guard": True,
         # Cron SCHEDULER provider (WHEN a due job fires). "" = built-in in-process 60s ticker. Name
         # an installed provider (plugins/cron_providers/<name>/ or $HERMES_HOME/plugins/ <name>/),
         # e.g. "chronos" (NAS-mediated managed cron for scale-to-zero). An unknown or unavailable

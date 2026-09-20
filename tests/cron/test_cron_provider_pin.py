@@ -42,7 +42,7 @@ def _base_job(**overrides):
 
 
 def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cron_model=None,
-         cron_model_provider=None):
+         cron_model_provider=None, model_drift_guard=None):
     """Drive run_job against a temp config.yaml whose ``model.default`` / ``model.provider`` are
     the CURRENT global defaults. Returns ``(success, error, agent_kwargs, resolve_kwargs)`` where
     the last two are the kwargs AIAgent / resolve_runtime_provider were called with (None when
@@ -59,6 +59,8 @@ def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cr
         cron_lines.append(f"  model: {cron_model}")
     if cron_model_provider is not None:
         cron_lines.append(f"  model_provider: {cron_model_provider}")
+    if model_drift_guard is not None:
+        cron_lines.append(f"  model_drift_guard: {str(model_drift_guard).lower()}")
     if cron_lines:
         config_yaml += "cron:\n" + "\n".join(cron_lines) + "\n"
     (tmp_path / "config.yaml").write_text(config_yaml)
@@ -137,6 +139,22 @@ class TestSnapshotIsTheEffectivePin:
         assert success is True, error
         assert agent_kwargs["model"] == "new-model"
         assert resolve_kwargs["requested"] is None
+
+    def test_drift_guard_false_makes_unpinned_job_follow_global_default(self, tmp_path):
+        """Operator opt-out ignores creation snapshots while preserving explicit job pins."""
+        job = _base_job(provider_snapshot="old-provider", model_snapshot="old-model")
+        success, error, agent_kwargs, resolve_kwargs = _run(
+            job,
+            tmp_path,
+            current_provider="new-provider",
+            current_model="new-model",
+            model_drift_guard=False,
+        )
+
+        assert success is True, error
+        assert agent_kwargs["model"] == "new-model"
+        assert resolve_kwargs["requested"] is None
+        assert resolve_kwargs["target_model"] == "new-model"
 
     def test_missing_model_guides_to_user_owned_cli(self, tmp_path, monkeypatch):
         """A missing-model failure cannot advertise agent-owned pinning."""

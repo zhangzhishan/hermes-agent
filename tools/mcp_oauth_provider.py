@@ -113,15 +113,25 @@ class HermesProviderMixin:
             raise OAuthNonInteractiveError(
                 "MCP device authorization requires `hermes mcp login <server> --flow device`; "
                 "background reconnects cannot start a device login")
-        self._tolerate_missing_iss_for_known_server()
         metadata_override = getattr(self, "_hermes_oauth_metadata_override", None)
         if metadata_override is not None:
             # The SDK's 401 path always performs discovery and may replace the
             # pinned metadata. Re-apply it at the last boundary before both
-            # authorization and token exchange, then enforce issuer binding
-            # against the endpoint that will actually receive credentials.
+            # authorization and token exchange.
             self.context.oauth_metadata = metadata_override
+            effective_issuer = str(metadata_override.issuer).rstrip("/")
+            credential_issuer = str(getattr(info, "issuer", "") or "").rstrip("/")
+            if credential_issuer and credential_issuer != effective_issuer:
+                from mcp.client.auth.exceptions import OAuthFlowError
+
+                raise OAuthFlowError(
+                    "Configured OAuth endpoint issuer does not match the issuer "
+                    "that registered this client; refusing to send client credentials"
+                )
+            # Refresh-token binding must be checked against the endpoint that
+            # will actually receive the credential, not transient discovery.
             enforce_refresh_token_issuer(self.context)
+        self._tolerate_missing_iss_for_known_server()
         configured_scope = getattr(self, "_hermes_configured_scope", None)
         if configured_scope:
             # Protected-resource discovery may advertise broader scopes than
@@ -632,6 +642,12 @@ def build_provider_kwargs(cfg: dict, storage: "HermesTokenStorage", *, ssh_proxy
                 "MCP OAuth endpoint override requires both "
                 "oauth.authorization_endpoint and oauth.token_endpoint"
             )
+        if not cfg.get("client_id"):
+            raise ValueError(
+                "MCP OAuth endpoint override requires a pre-registered oauth.client_id; "
+                "dynamic registration must not discover one authorization server and "
+                "send its credentials to a different pinned token endpoint"
+            )
         from urllib.parse import urlsplit
         from mcp.shared.auth import OAuthMetadata
 
@@ -650,6 +666,7 @@ def build_provider_kwargs(cfg: dict, storage: "HermesTokenStorage", *, ssh_proxy
             "grant_types_supported",
             "token_endpoint_auth_methods_supported",
             "code_challenge_methods_supported",
+            "authorization_response_iss_parameter_supported",
         ):
             if cfg.get(field_name) is not None:
                 metadata_dict[field_name] = cfg[field_name]
